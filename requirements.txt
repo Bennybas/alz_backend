@@ -3,3 +3,4 @@ uvicorn==0.34.0
 langchain_groq==0.2.1
 langchain-core==0.3.25
 python-dotenv==1.0.1
+pydantic==2.10.3
