@@ -6,116 +6,104 @@ from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from dotenv import load_dotenv
 import asyncio
 import re
- 
-# Load environment variables
+
 load_dotenv()
- 
-# Initialize FastAPI app with CORS
+
+# Validate API Key
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY must be set in environment variables")
+
 app = FastAPI()
- 
-# Add CORS middleware to allow frontend requests
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins - adjust in production
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
- 
-# Initialize LangChain components
+
+# Enhanced Prompt with More Specific Instructions
 prompt = ChatPromptTemplate.from_messages([
-    ("system", '''You are AIVY, a sophisticated Healthcare-based Q&A Chatbot.
-    Your primary goal is to provide detailed, accurate, and helpful information
-    related to patient journeys, healthcare processes, medical guidance,
-    and healthcare support.
-   
-    Guidelines:
-    - Focus on healthcare-related queries
-    - Provide comprehensive and clear answers
-    - Maintain a professional and empathetic tone
-    - If a query is not healthcare-related, politely redirect the user
-   
-    Key Areas of Expertise:
-    - Patient Journey Navigation
-    - Healthcare Services
-    - Medical Information
-    - Healthcare Support Systems'''),
+    ("system", """You are AIVY, a sophisticated Healthcare AI Assistant.
+    Provide clear, concise, and accurate responses about healthcare topics.
+    
+    Communication Guidelines:
+    - Be direct and informative
+    - Use professional medical terminology
+    - Maintain a compassionate and professional tone
+    - Provide comprehensive yet succinct answers"""),
     ("human", "{Question}")
 ])
- 
-# Use the most appropriate OpenAI model available
+
+# LLM Configuration
 llm = ChatGroq(
-    model='llama-3.3-70b-versatile',  # Or use another appropriate model
-    temperature=0,  # Moderate creativity
-    )
- 
-# Input model for user query
+    model='llama-3.3-70b-versatile',
+    temperature=0.2,
+    api_key=GROQ_API_KEY
+)
+
 class UserQuery(BaseModel):
     message: str
+
+
+
+
+def clean_text(text: str) -> str:
+    """
+    Advanced text cleaning to handle streaming text issues
+    """
+    # Remove excessive whitespaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove spaces before punctuation
+    text = re.sub(r'\s+([.,!?])', r'\1', text)
+    
+    # Trim leading/trailing spaces
+    return text.strip()
+
 async def stream_response(chain, question):
     """
-    Generator function to stream responses with proper spacing.
+    Improved streaming response with better chunk handling
     """
-    buffer = ""  # Temporary storage for accumulating chunks
     try:
+        full_response = ""
         async for chunk in chain.astream({"Question": question}):
             if chunk:
-                # Append the new chunk to the buffer
-                buffer += chunk
-               
-                # Process the buffer to ensure word separation
-                while " " in buffer:  # Look for complete words in the buffer
-                    word, buffer = buffer.split(" ", 1)  # Split at the first space
-                    yield f"data: {word} \n\n"  # Stream the word
-               
-                # Handle cases where chunks are concatenated without spaces
-                if len(buffer) > 100:  # Arbitrary limit to avoid very large chunks
-                    partial_word = buffer
-                    buffer = ""
-                   
-                    yield f"data: {partial_word} \n\n"  # Stream the partial content
-               
-            await asyncio.sleep(0.05)  # Simulate typing delay
-       
-        # Handle headings and numbered lists explicitly
-        if buffer.strip():
-            # Ensure headings like "1. Sarcomas" or "Types of Cancer:" are on new lines
-            buffer = re.sub(r'(\d+\.[^\n]+:)', r'\n\1\n', buffer)  # Detect numbered headings
-            buffer = re.sub(r'([A-Z][a-zA-Z\s]+:)', r'\n\1\n', buffer)  # Detect general headings
-            yield f"data: {buffer.strip()} \n\n"
-       
-        # Final message to indicate the stream completion
-        yield f"data: [DONE]\n\n"
+                full_response += chunk
+                
+                # Clean the accumulated response
+                cleaned_response = clean_text(full_response)
+                
+                # Stream the entire cleaned response
+                yield f"data: {cleaned_response} \n\n"
+                
+                # Small delay to simulate natural typing
+                await asyncio.sleep(0.05)
+        
+        # Final streaming signal
+        yield "data: [DONE]\n\n"
+    
     except Exception as e:
-        yield f"data: Error occurred: {str(e)}\n\n"
- 
- 
- 
+        yield f"data: Error in response: {str(e)}\n\n"
+
 @app.post("/chat")
-async def chat_with_bot(query: UserQuery):
+async def chat_endpoint(query: UserQuery):
     try:
-        # Create a chain with streaming support
         chain = prompt | llm | StrOutputParser()
-       
-        # Return a streaming response
+        
         return StreamingResponse(
             stream_response(chain, query.message),
             media_type="text/event-stream"
         )
-   
+    
     except Exception as e:
-        print(f"Error processing query: {e}")
-        return {
-            "response": "Sorry, there was an issue processing your request. Please try again."
-        }
- 
-# Optional: Health check endpoint
+        return {"error": str(e)}
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
- 
-# Run with: uvicorn main:app --reload
+    return {"status": "healthy", "version": "1.0.0"}
