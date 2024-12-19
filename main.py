@@ -24,7 +24,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://alzheimers-patient-journey-6uah.onrender.com/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -96,10 +96,6 @@ multipage_qa_chain = (
 )
 
 def summary_list_exploder(l):
-    # Add detailed logging
-    print(f"summary_list_exploder input type: {type(l)}")
-    print(f"summary_list_exploder input content: {l}")
-    
     if not isinstance(l, list):
         raise TypeError(f"Expected list, got {type(l)}")
     
@@ -192,8 +188,8 @@ async def generate_response(question):
         }
     else:
         return {
-            'message': "Hi I'm Aivy, here to help you with the Dashboard",
-            'suggested_questions': []
+            'message': "Hi I'm AIVY, here to help you with the Patient Journey",
+            'suggested_questions': ['Explain barriers in Initial Assesment','Impact Measures of Diagnosis Stage']
         }
 
 async def stream_response(question):
