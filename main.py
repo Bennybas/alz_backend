@@ -1,5 +1,7 @@
 import os
-from fastapi import FastAPI
+import json
+import asyncio
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -8,8 +10,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from dotenv import load_dotenv
-
-import json
 from tavily import TavilyClient
 
 load_dotenv()
@@ -158,45 +158,85 @@ similar_prompt_generator_chain = (
 class UserQuery(BaseModel):
     message: str
 
+@app.post("/chat")
+async def chat_endpoint(query: UserQuery):
+    try:
+        # Add timeout for the entire operation
+        async with asyncio.timeout(25):  # 25 seconds timeout
+            return StreamingResponse(
+                stream_response(query.message),
+                media_type="text/event-stream"
+            )
+    except asyncio.TimeoutError:
+        return StreamingResponse(
+            stream_error_response("Request timed out"),
+            media_type="text/event-stream"
+        )
+    except Exception as e:
+        return StreamingResponse(
+            stream_error_response(f"Error processing request: {str(e)}"),
+            media_type="text/event-stream"
+        )
+
+async def stream_error_response(error_message: str):
+    error_response = {
+        'message': error_message,
+        'suggested_questions': []
+    }
+    yield f"data: {json.dumps(error_response)}\n\n"
+    yield "data: [DONE]\n\n"
+
 async def generate_response(question):
-    """Generate comprehensive response with research and suggested questions"""
-    # Check if healthcare-related
-    is_healthcare = await prompt_classifier_chain.ainvoke({'question': question})
-    
-    if is_healthcare == 'Yes':
-        # Perform research
-        research_response = await final_research_report_chain.ainvoke({'question': question})
-        # Ensure the research response is a string
-        if isinstance(research_response, list):
-            research_response = "\n".join(map(str, research_response))  # Combine list items into a single string
-        elif not isinstance(research_response, str):
-            research_response = str(research_response)  # Convert any non-string result to string
-
-        # Generate suggested questions
-        suggested_questions = await similar_prompt_generator_chain.ainvoke({'question': question})
+    try:
+        # Add timeout for classification
+        async with asyncio.timeout(5):  # 5 second timeout
+            is_healthcare = await prompt_classifier_chain.ainvoke({'question': question})
         
-        # Ensure suggested_questions is a list
-        if not isinstance(suggested_questions, list):
-            suggested_questions = (suggested_questions[1:-1]).split(",")
-            for i in range(0,len(suggested_questions)):
-                suggested_questions[i]=suggested_questions[i].replace("'","")
+        if is_healthcare == 'Yes':
+            try:
+                # Add timeout for research response
+                async with asyncio.timeout(15):  # 15 second timeout
+                    research_response = await final_research_report_chain.ainvoke({'question': question})
+                    
+                    if isinstance(research_response, list):
+                        research_response = "\n".join(map(str, research_response))
+                    elif not isinstance(research_response, str):
+                        research_response = str(research_response)
 
+                # Add timeout for suggested questions
+                async with asyncio.timeout(5):  # 5 second timeout
+                    suggested_questions = await similar_prompt_generator_chain.ainvoke({'question': question})
+                    
+                    if not isinstance(suggested_questions, list):
+                        suggested_questions = (suggested_questions[1:-1]).split(",")
+                        suggested_questions = [q.strip().replace("'","") for q in suggested_questions]
 
-        return {
-            'message': research_response,
-            'suggested_questions': suggested_questions  
-        }
-    else:
-        return {
-            'message': "Hi I'm AIVY, here to help you with the Patient Journey",
-            'suggested_questions': ['Explain barriers in Initial Assesment','Impact Measures of Diagnosis Stage']
-        }
+                return {
+                    'message': research_response,
+                    'suggested_questions': suggested_questions
+                }
+            except asyncio.TimeoutError:
+                # Fallback response if research times out
+                return {
+                    'message': "I apologize, but the research is taking longer than expected. Please try asking your question again or rephrase it.",
+                    'suggested_questions': ['Could you rephrase your question?', 'Try breaking down your question into smaller parts']
+                }
+        else:
+            return {
+                'message': "Hi I'm AIVY, here to help you with the Patient Journey",
+                'suggested_questions': ['Explain barriers in Initial Assessment', 'Impact Measures of Diagnosis Stage']
+            }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Operation timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
 
 async def stream_response(question):
     """Stream response with error handling"""
     try:
-        # Generate full response
-        full_response = await generate_response(question)
+        # Generate full response with timeout
+        async with asyncio.timeout(20):  # 20 second timeout
+            full_response = await generate_response(question)
         
         # Ensure message is a string and suggested_questions is a list
         full_response['message'] = str(full_response['message'])
@@ -207,23 +247,20 @@ async def stream_response(question):
         yield f"data: {sanitized_response}\n\n"
         yield "data: [DONE]\n\n"
     
-    except Exception as e:
+    except asyncio.TimeoutError:
         error_response = {
-            'message': f"Error: {str(e)}"
+            'message': "Request timed out. Please try again.",
+            'suggested_questions': []
         }
         yield f"data: {json.dumps(error_response)}\n\n"
         yield "data: [DONE]\n\n"
-
-@app.post("/chat")
-async def chat_endpoint(query: UserQuery):
-    return StreamingResponse(
-        stream_response(query.message),
-        media_type="text/event-stream"
-    )
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "version": "1.0.0"}
+    except Exception as e:
+        error_response = {
+            'message': f"Error: {str(e)}",
+            'suggested_questions': []
+        }
+        yield f"data: {json.dumps(error_response)}\n\n"
+        yield "data: [DONE]\n\n"
 
 if __name__ == "__main__":
     import uvicorn
