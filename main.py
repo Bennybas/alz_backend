@@ -4,12 +4,13 @@ import asyncio
 import logging
 import time
 import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -27,56 +28,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Key Validations
+# Environment variables
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')
 APP_URL = os.getenv('APP_URL', 'https://alzheimers-patient-journey-6uah.onrender.com/')
 
+# Validate required environment variables
 if not GROQ_API_KEY or not TAVILY_API_KEY:
     raise ValueError("GROQ_API_KEY and TAVILY_API_KEY must be set in environment variables")
 
-# Initialize FastAPI app
-app = FastAPI()
+# Global state management
+class GlobalState:
+    def __init__(self):
+        self.groq_llm: Optional[ChatGroq] = None
+        self.tavily_client: Optional[TavilyClient] = None
+        self.prompt_classifier_llm = None
+        self.similar_question_generator_llm = None
+        self.is_initialized: bool = False
+        self.initialization_lock: asyncio.Lock = asyncio.Lock()
+        self.retry_count: int = 0
+        self.max_retries: int = 3
+        self.response_cache: Dict[str, Any] = {}
+        self.cache_expiry: int = 3600  # 1 hour
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+global_state = GlobalState()
 
-# Global variables for clients
-groq_llm = None
-tavily_client = None
+# Pydantic models
+class UserQuery(BaseModel):
+    message: str
 
-# Cache for storing recent results
-response_cache: Dict[str, Any] = {}
-CACHE_EXPIRY = 3600  # 1 hour in seconds
+class PromptClassifier(BaseModel):
+    response: str = Field(description="'Yes' if healthcare-related, 'No' otherwise")
 
-# Tavily Search Function with caching
-async def tavily_search_function(q: str):
-    cache_key = f"tavily_search_{q}"
-    if cache_key in response_cache:
-        logger.info("Returning cached search results")
-        return response_cache[cache_key]
-    
-    try:
-        # Convert synchronous Tavily call to async context
-        search_results = await asyncio.to_thread(
-            tavily_client.search,
-            q,
-            max_results=5,
-            include_answer=True
-        )
-        response_cache[cache_key] = search_results['results']
-        return search_results['results']
-    except Exception as e:
-        logger.error(f"Tavily search error: {str(e)}")
-        raise
+class SimilarQuestionGenerator(BaseModel):
+    response: List[str] = Field(description='3 similar questions based on the given question')
 
-# Prompt Templates
+# Prompt templates
 TEXT_TO_SEARCHQUERY_PROMPT = ChatPromptTemplate.from_messages([
     ('system', '''Write 3 google search queries to search online that form an 
             "objective opinion from the following: {question}\n"
@@ -94,7 +81,8 @@ WEB_PAGE_QA_PROMPT = ChatPromptTemplate.from_messages([
         Include all factual information, numbers, stats etc if available.""")
 ])
 
-WRITER_SYSTEM_PROMPT = "You are an AI critical thinker research assistant. Your sole purpose is to write well written, critically acclaimed, objective and structured reports on given text."
+WRITER_SYSTEM_PROMPT = """You are an AI critical thinker research assistant. 
+Your sole purpose is to write well written, critically acclaimed, objective and structured reports on given text."""
 
 RESEARCH_REPORT_TEMPLATE = """Information:
     --------
@@ -105,54 +93,67 @@ RESEARCH_REPORT_TEMPLATE = """Information:
     in-depth, with facts and numbers if available.
     You should strive to write the answer as concise as possible, using all relevant and necessary information provided.
     Write the answer with markdown syntax.
-    You MUST determine your own concrete and valid opinion based on the given information. Avoid general or vague responses.You must always give more importance to the latest information that is from the year 2024 in your answer.The response must not be in a report format.Do not mention where the information comes from or reference any context in your response.Avoid general or vague responses
+    You MUST determine your own concrete and valid opinion based on the given information. 
+    Avoid general or vague responses. You must always give more importance to the latest information that is from the year 2024 in your answer.
+    The response must not be in a report format. Do not mention where the information comes from or reference any context in your response.
     Dont Include Question in your Response"""
 
-# Define final_research_prompt here
+PROMPT_CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
+    ('system', '''Classify the question: 
+    Respond 'Yes' if related to healthcare, medicine, pharma, personal health
+    Respond 'No' if unrelated.
+    Question:{question}''')
+])
+
+SIMILAR_QUESTION_PROMPT = ChatPromptTemplate.from_messages([
+    ('system', '''Your task is to generate 3 similar questions based on the given question which should be in a list
+    Question:{question}''')
+])
+
 final_research_prompt = ChatPromptTemplate.from_messages([
     ('system', WRITER_SYSTEM_PROMPT),
     ('user', RESEARCH_REPORT_TEMPLATE)
 ])
 
-# Initialize chains during startup
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Initializing server components...")
-    global groq_llm, tavily_client, prompt_classifier_llm, similar_question_generator_llm
+# Helper functions
+def summary_list_exploder(l: List[str]) -> str:
+    if not isinstance(l, list):
+        raise TypeError(f"Expected list, got {type(l)}")
+    return "\n\n".join(map(str, l))
+
+async def tavily_search_function(q: str) -> List[Dict[str, Any]]:
+    cache_key = f"tavily_search_{q}"
+    
+    if cache_key in global_state.response_cache:
+        logger.info("Returning cached search results")
+        return global_state.response_cache[cache_key]
     
     try:
-        groq_llm = ChatGroq(
-            model='llama-3.3-70b-versatile',
-            temperature=0.2,
-            api_key=GROQ_API_KEY
+        search_results = await asyncio.to_thread(
+            global_state.tavily_client.search,
+            q,
+            max_results=5,
+            include_answer=True
         )
-        tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        
-        # Initialize classifier and generator
-        prompt_classifier_llm = groq_llm.with_structured_output(PromptClassifier)
-        similar_question_generator_llm = groq_llm.with_structured_output(SimilarQuestionGenerator)
-        
-        # Initialize chains
-        await initialize_chains()
-        
-        logger.info("Server components initialized successfully")
+        global_state.response_cache[cache_key] = search_results['results']
+        return search_results['results']
     except Exception as e:
-        logger.error(f"Error during startup: {str(e)}")
+        logger.error(f"Tavily search error: {str(e)}")
         raise
 
 # Initialize chains
 async def initialize_chains():
-    global text_to_searchquery_chain, web_page_qa_chain, multipage_qa_chain, complete_summarizer_chain
-    global final_research_report_chain, prompt_classifier_chain, similar_prompt_generator_chain
+    global text_to_searchquery_chain, web_page_qa_chain, multipage_qa_chain
+    global complete_summarizer_chain, final_research_report_chain
+    global prompt_classifier_chain, similar_prompt_generator_chain
 
-    # Wrap synchronous tavily search in async
     async def async_search_wrapper(x):
         results = await tavily_search_function(x['question'])
         return results
 
     text_to_searchquery_chain = (
         TEXT_TO_SEARCHQUERY_PROMPT 
-        | groq_llm 
+        | global_state.groq_llm 
         | StrOutputParser() 
         | (lambda x: x[1:-1].replace('"',"").split(",")) 
         | (lambda x: [{'question': i} for i in x])
@@ -178,87 +179,101 @@ async def initialize_chains():
     final_research_report_chain = (
         RunnablePassthrough.assign(research_summary=complete_summarizer_chain)
         | final_research_prompt
-        | groq_llm
+        | global_state.groq_llm
         | StrOutputParser()
     )
-    
+
     prompt_classifier_chain = (
         PROMPT_CLASSIFIER_PROMPT 
-        | prompt_classifier_llm 
+        | global_state.prompt_classifier_llm 
         | (lambda x: x.response)
     )
-    
+
     similar_prompt_generator_chain = (
         SIMILAR_QUESTION_PROMPT 
-        | similar_question_generator_llm 
+        | global_state.similar_question_generator_llm 
         | (lambda x: str(x.response))
     )
 
-# Helper function for summary list
-def summary_list_exploder(l):
-    if not isinstance(l, list):
-        raise TypeError(f"Expected list, got {type(l)}")
+# Service initialization
+async def initialize_services():
+    try:
+        global_state.groq_llm = ChatGroq(
+            model='llama-3.3-70b-versatile',
+            temperature=0.2,
+            api_key=GROQ_API_KEY
+        )
+        global_state.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        
+        # Initialize LLM variants
+        global_state.prompt_classifier_llm = global_state.groq_llm.with_structured_output(PromptClassifier)
+        global_state.similar_question_generator_llm = global_state.groq_llm.with_structured_output(SimilarQuestionGenerator)
+        
+        await initialize_chains()
+        logger.info("Services initialized successfully")
+    except Exception as e:
+        logger.error(f"Service initialization error: {str(e)}")
+        raise
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    retry_delay = 1
+    while not global_state.is_initialized and global_state.retry_count < global_state.max_retries:
+        try:
+            async with global_state.initialization_lock:
+                if not global_state.is_initialized:
+                    await initialize_services()
+                    global_state.is_initialized = True
+        except Exception as e:
+            global_state.retry_count += 1
+            logger.error(f"Initialization attempt {global_state.retry_count} failed: {str(e)}")
+            await asyncio.sleep(retry_delay)
+            retry_delay *= 2
     
-    final_researched_content = "\n\n".join(map(str, l))
-    return final_researched_content
+    yield
+    
+    # Cleanup
+    global_state.is_initialized = False
+    logger.info("Application shutdown complete")
 
-# Prompt Classifier
-class PromptClassifier(BaseModel):
-    response: str = Field(description="'Yes' if healthcare-related, 'No' otherwise")
+# Initialize FastAPI app
+app = FastAPI(lifespan=lifespan)
 
-PROMPT_CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
-    ('system', '''Classify the question: 
-    Respond 'Yes' if related to healthcare, medicine, pharma, personal health
-    Respond 'No' if unrelated.
-    Question:{question}''')
-])
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-prompt_classifier_llm = None  # Will be initialized during startup
+# Error handling middleware
+@app.middleware("http")
+async def error_handling_middleware(request, call_next):
+    try:
+        if not global_state.is_initialized:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "Service is initializing. Please try again in a few moments."}
+            )
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error(f"Request error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "An unexpected error occurred. Please try again."}
+        )
 
-# Similar Question Generator
-class SimilarQuestionGenerator(BaseModel):
-    response: list = Field(description='3 similar questions based on the given question should be in a list')
-
-SIMILAR_QUESTION_PROMPT = ChatPromptTemplate.from_messages([
-    ('system', '''Your task is to generate 3 similar questions based on the given question which should be in a list\nQuestion:{question}''')
-])
-
-# Keep-alive mechanism
-async def keep_alive():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(f"{APP_URL}/health") as response:
-                    logger.info(f"Keep-alive ping sent. Status: {response.status}")
-            except Exception as e:
-                logger.error(f"Keep-alive ping failed: {str(e)}")
-            await asyncio.sleep(14 * 60)  # 14 minutes
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.datetime.now().isoformat()}
-
-# Request model
-class UserQuery(BaseModel):
-    message: str
-
-# Enhanced error handling for stream response
-async def stream_error_response(error_message: str):
-    error_response = {
-        'message': error_message,
-        'suggested_questions': []
-    }
-    yield f"data: {json.dumps(error_response)}\n\n"
-    yield "data: [DONE]\n\n"
-
-# Enhanced response generation
+# Response generation
 async def generate_response(question: str):
     cache_key = f"response_{question}"
     
-    if cache_key in response_cache:
+    if cache_key in global_state.response_cache:
         logger.info("Returning cached response")
-        return response_cache[cache_key]
+        return global_state.response_cache[cache_key]
     
     try:
         async with asyncio.timeout(5):
@@ -278,20 +293,20 @@ async def generate_response(question: str):
                     suggested_questions = await similar_prompt_generator_chain.ainvoke({'question': question})
                     
                     if not isinstance(suggested_questions, list):
-                        suggested_questions = eval(suggested_questions)  # Safely evaluate string representation of list
+                        suggested_questions = eval(suggested_questions)
 
                 response = {
                     'message': research_response,
                     'suggested_questions': suggested_questions
                 }
                 
-                response_cache[cache_key] = response
+                global_state.response_cache[cache_key] = response
                 return response
                 
             except asyncio.TimeoutError:
                 return {
                     'message': "I apologize, but the research is taking longer than expected. Please try again or rephrase your question.",
-                    'suggested_questions': ['Could you rephrase your question?', 'Try breaking down your question into smaller parts']
+                    'suggested_questions': ['Explain barriers in Initial Assessment', 'Impact Measures of Diagnosis Stage']
                 }
         else:
             return {
@@ -302,82 +317,80 @@ async def generate_response(question: str):
         logger.error(f"Error generating response: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Enhanced streaming response
+# Streaming response handlers
+async def stream_error_response(error_message: str):
+    error_response = {
+        'message': error_message,
+        'suggested_questions': []
+    }
+    yield f"data: {json.dumps(error_response)}\n\n"
+    yield "data: [DONE]\n\n"
+
 async def stream_response(question: str):
     try:
         async with asyncio.timeout(20):
             full_response = await generate_response(question)
-            
-            # Ensure proper response format
-            full_response['message'] = str(full_response['message'])
-            full_response['suggested_questions'] = list(full_response['suggested_questions'])
-            
-            # Stream the response
             yield f"data: {json.dumps(full_response)}\n\n"
             yield "data: [DONE]\n\n"
-            
     except asyncio.TimeoutError:
         logger.error("Response streaming timed out")
-        error_response = {
-            'message': "Request timed out. Please try again.",
-            'suggested_questions': []
-        }
-        yield f"data: {json.dumps(error_response)}\n\n"
-        yield "data: [DONE]\n\n"
+        async for chunk in stream_error_response("Request timed out. Please try again."):
+            yield chunk
     except Exception as e:
         logger.error(f"Error streaming response: {str(e)}")
-        error_response = {
-            'message': f"Error: {str(e)}",
-            'suggested_questions': []
-        }
-        yield f"data: {json.dumps(error_response)}\n\n"
-        yield "data: [DONE]\n\n"
+        async for chunk in stream_error_response(f"Error processing request: {str(e)}"):
+            yield chunk
 
-# Enhanced chat endpoint
+# Endpoints
 @app.post("/chat")
 async def chat_endpoint(query: UserQuery):
+    if not global_state.is_initialized:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service is still initializing. Please try again in a few moments."
+        )
+    
     try:
         logger.info(f"Received chat request: {query.message[:50]}...")
-        
-        async with asyncio.timeout(20):
-            return StreamingResponse(
-                stream_response(query.message),
-                media_type="text/event-stream"
-            )
-    except asyncio.TimeoutError:
-        logger.error("Chat endpoint timed out")
         return StreamingResponse(
-            stream_error_response("Request timed out"),
+            stream_response(query.message),
             media_type="text/event-stream"
         )
     except Exception as e:
         logger.error(f"Chat endpoint error: {str(e)}")
         return StreamingResponse(
-            stream_error_response(f"Error processing request: {str(e)}"),
+            stream_error_response(str(e)),
             media_type="text/event-stream"
         )
 
-# Periodic cache cleanup
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy" if global_state.is_initialized else "initializing",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "initialization_attempts": global_state.retry_count,
+        "services_ready": global_state.is_initialized
+    }
+
+# Cache cleanup
 async def cleanup_cache():
     while True:
         try:
             current_time = time.time()
-            keys_to_remove = [
-                key for key, (timestamp, _) in response_cache.items()
-                if current_time - timestamp > CACHE_EXPIRY
-            ]
+            keys_to_remove = []
+            for key in global_state.response_cache:
+                if current_time - global_state.response_cache[key].get('timestamp', 0) > global_state.cache_expiry:
+                    keys_to_remove.append(key)
+            
             for key in keys_to_remove:
-                del response_cache[key]
+                del global_state.response_cache[key]
+            
             logger.info(f"Cleaned up {len(keys_to_remove)} cached items")
         except Exception as e:
             logger.error(f"Cache cleanup error: {str(e)}")
-        await asyncio.sleep(3600)  # Run every hour
+        await asyncio.sleep(3600)  # Run cache cleanup every hour
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    # Start background tasks
-    asyncio.create_task(keep_alive())
+# Run cache cleanup as a background task
+@app.on_event("startup")
+async def startup_event():
     asyncio.create_task(cleanup_cache())
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
