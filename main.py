@@ -90,6 +90,7 @@ web_page_qa_chain = (
     | (lambda x: f"Summary:{x['summary']}\nURL:{x['url']}")
 )
 
+# Ensure tavily_search_function is async
 async def tavily_search_function(q: str) -> list:
     try:
         tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
@@ -101,7 +102,7 @@ async def tavily_search_function(q: str) -> list:
 
 multipage_qa_chain = (
     RunnablePassthrough.assign(text=lambda x: tavily_search_function(x['question']))
-    | (lambda x: [{'question': x['question'], 'text': i['content'], 'url': i['url']} for i in x['text']])
+    | (lambda x: [{'question': x['question'], 'text': i['content'], 'url': i['url']} for i in await x['text']])
     | web_page_qa_chain.map()
 )
 
@@ -175,7 +176,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://alzheimers-patient-journey-6uah.onrender.com"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -195,22 +196,20 @@ async def stream_error_response(error_message: str):
 # Response Generator
 async def generate_response(question: str) -> dict:
     try:
-        async with asyncio.timeout(5):
-            is_healthcare = await prompt_classifier_chain.ainvoke({'question': question})
-            logger.info(f"Classification result: {is_healthcare}")
+        is_healthcare = await prompt_classifier_chain.ainvoke({'question': question})
+        logger.info(f"Classification result: {is_healthcare}")
 
         if is_healthcare == 'Yes':
             try:
-                async with asyncio.timeout(15):
-                    research_response = await final_research_report_chain.ainvoke({'question': question})
-                    
-                    if isinstance(research_response, list):
-                        research_response = "\n".join(map(str, research_response))
-                    
-                    suggested_questions = await similar_prompt_generator_chain.ainvoke({'question': question})
-                    
-                    if isinstance(suggested_questions, str):
-                        suggested_questions = json.loads(suggested_questions.replace("'", '"'))
+                research_response = await final_research_report_chain.ainvoke({'question': question})
+                
+                if isinstance(research_response, list):
+                    research_response = "\n".join(map(str, research_response))
+                
+                suggested_questions = await similar_prompt_generator_chain.ainvoke({'question': question})
+                
+                if isinstance(suggested_questions, str):
+                    suggested_questions = json.loads(suggested_questions.replace("'", '"'))
 
                 return {
                     'message': research_response,
@@ -233,17 +232,16 @@ async def generate_response(question: str) -> dict:
 
 async def stream_response(question: str):
     try:
-        async with asyncio.timeout(20):
-            response = await generate_response(question)
-            
-            sanitized_response = json.dumps({
-                'message': str(response['message']),
-                'suggested_questions': list(response.get('suggested_questions', []))
-            })
-            
-            yield f"data: {sanitized_response}\n\n"
-            yield "data: [DONE]\n\n"
-            
+        response = await generate_response(question)
+        
+        sanitized_response = json.dumps({
+            'message': str(response['message']),
+            'suggested_questions': list(response.get('suggested_questions', []))
+        })
+        
+        yield f"data: {sanitized_response}\n\n"
+        yield "data: [DONE]\n\n"
+        
     except asyncio.TimeoutError:
         logger.error("Stream response timed out")
         error_response = json.dumps({
@@ -252,28 +250,15 @@ async def stream_response(question: str):
         })
         yield f"data: {error_response}\n\n"
         yield "data: [DONE]\n\n"
-    except Exception as e:
-        logger.error(f"Stream response error: {str(e)}")
-        error_response = json.dumps({
-            'message': f"An error occurred: {str(e)}",
-            'suggested_questions': []
-        })
-        yield f"data: {error_response}\n\n"
-        yield "data: [DONE]\n\n"
 
 @app.post("/chat")
-async def chat_endpoint(query: UserQuery, background_tasks: BackgroundTasks):
+async def submit_query(user_query: UserQuery, background_tasks: BackgroundTasks):
     try:
-        return StreamingResponse(
-            stream_response(query.message),
-            media_type="text/event-stream"
-        )
+        background_tasks.add_task(stream_response, user_query.message)
+        return StreamingResponse(stream_response(user_query.message), media_type="text/event-stream")
     except Exception as e:
-        logger.error(f"Chat endpoint error: {str(e)}")
-        return StreamingResponse(
-            stream_error_response(f"Error processing request: {str(e)}"),
-            media_type="text/event-stream"
-        )
+        logger.error(f"Error in submit_query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
